@@ -453,3 +453,305 @@ async fn test_mermaid_js_etag_caching() {
     assert_eq!(response_200.status_code(), 200);
     assert!(!response_200.as_bytes().is_empty());
 }
+
+// ============================================================================
+// FASE 1: Directory Detection Tests (Outside-In TDD)
+// ============================================================================
+
+#[tokio::test]
+async fn test_new_router_accepts_file_path() {
+    use tempfile::NamedTempFile;
+
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    fs::write(&temp_file, "# File Test").expect("Failed to write temp file");
+
+    let canonical_path = temp_file
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| temp_file.path().to_path_buf());
+
+    // Should successfully create router for file
+    let result = new_router(canonical_path);
+    assert!(result.is_ok(), "new_router should accept file path");
+}
+
+#[tokio::test]
+async fn test_new_router_accepts_directory_path() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    // Create a markdown file in the directory
+    let md_path = temp_dir.path().join("test.md");
+    fs::write(&md_path, "# Directory Test").expect("Failed to write markdown file");
+
+    let canonical_path = temp_dir
+        .path()
+        .canonicalize()
+        .expect("Failed to canonicalize directory");
+
+    // Should successfully create router for directory
+    let result = new_router(canonical_path);
+    assert!(
+        result.is_ok(),
+        "new_router should accept directory path: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn test_serve_markdown_detects_file_vs_directory() {
+    use tempfile::{tempdir, NamedTempFile};
+
+    // Test with file
+    let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+    fs::write(&temp_file, "# File").expect("Failed to write temp file");
+    let file_path = temp_file
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| temp_file.path().to_path_buf());
+
+    let router_file = new_router(file_path);
+    assert!(router_file.is_ok(), "Should handle file path");
+
+    // Test with directory
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let md_path = temp_dir.path().join("test.md");
+    fs::write(&md_path, "# Dir").expect("Failed to write markdown file");
+    let dir_path = temp_dir.path().canonicalize().expect("Canonicalize dir");
+
+    let router_dir = new_router(dir_path);
+    assert!(router_dir.is_ok(), "Should handle directory path");
+}
+
+// ============================================================================
+// FASE 2: Directory Listing Tests (Outside-In TDD)
+// ============================================================================
+
+#[tokio::test]
+async fn test_directory_root_lists_markdown_files() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    // Create multiple markdown files
+    fs::write(temp_dir.path().join("README.md"), "# README").expect("Write failed");
+    fs::write(temp_dir.path().join("notes.md"), "# Notes").expect("Write failed");
+    fs::write(temp_dir.path().join("todo.txt"), "Todo list").expect("Write failed");
+
+    // Create subdirectory
+    let sub_dir = temp_dir.path().join("docs");
+    fs::create_dir(&sub_dir).expect("Failed to create subdir");
+    fs::write(sub_dir.join("api.md"), "# API").expect("Write failed");
+
+    let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
+    let router = new_router(canonical_path).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create test server");
+
+    let response = server.get("/").await;
+
+    assert_eq!(response.status_code(), 200);
+    let body = response.text();
+
+    // Should list markdown files
+    assert!(body.contains("README.md"), "Should list README.md");
+    assert!(body.contains("notes.md"), "Should list notes.md");
+    assert!(body.contains("todo.txt"), "Should list todo.txt");
+
+    // Should list subdirectory
+    assert!(body.contains("docs"), "Should list docs directory");
+}
+
+#[tokio::test]
+async fn test_directory_serves_specific_file() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+
+    fs::write(temp_dir.path().join("test.md"), "# Test File\n\n**Bold**")
+        .expect("Write failed");
+    fs::write(temp_dir.path().join("other.md"), "# Other").expect("Write failed");
+
+    let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
+    let router = new_router(canonical_path).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create test server");
+
+    // Request specific file
+    let response = server.get("/view/test.md").await;
+
+    assert_eq!(response.status_code(), 200);
+    let body = response.text();
+
+    // Should render the markdown file
+    assert!(body.contains("<h1>Test File</h1>"));
+    assert!(body.contains("<strong>Bold</strong>"));
+}
+
+#[tokio::test]
+async fn test_directory_serves_raw_file() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let content = "# Raw Test\n\nContent";
+
+    fs::write(temp_dir.path().join("raw.md"), content).expect("Write failed");
+
+    let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
+    let router = new_router(canonical_path).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create test server");
+
+    let response = server.get("/raw/raw.md").await;
+
+    assert_eq!(response.status_code(), 200);
+    let body = response.text();
+
+    // Should return raw markdown
+    assert_eq!(body, content);
+}
+
+#[tokio::test]
+async fn test_directory_prevents_path_traversal() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    fs::write(temp_dir.path().join("safe.md"), "# Safe").expect("Write failed");
+
+    let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
+    let router = new_router(canonical_path).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create test server");
+
+    // Try path traversal
+    let response = server.get("/view/../../../etc/passwd").await;
+
+    // Should return 403 or 404, not 200
+    assert_ne!(response.status_code(), 200);
+    assert!(
+        response.status_code() == 403 || response.status_code() == 404,
+        "Should prevent path traversal"
+    );
+}
+
+// ============================================================================
+// Network Binding Tests (TDD for external accessibility)
+// ============================================================================
+
+#[test]
+fn test_default_hostname_must_be_public_for_containers() {
+    // RED: This test MUST FAIL initially
+    // 
+    // REQUIREMENT: Default hostname must be "0.0.0.0" not "127.0.0.1"
+    // 
+    // WHY: In containerized/cloud environments (Docker, Gitpod, etc.),
+    // binding to 127.0.0.1 makes the server ONLY accessible from inside
+    // the container. External access requires binding to 0.0.0.0.
+    //
+    // CURRENT STATE: main.rs has default_value = "127.0.0.1" 
+    // REQUIRED STATE: main.rs must have default_value = "0.0.0.0"
+    //
+    // TO FIX: Change line 18 in src/main.rs from:
+    //   #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    // TO:
+    //   #[arg(short = 'H', long, default_value = "0.0.0.0")]
+    
+    // This test reads the source file to verify the default value
+    let main_rs = std::fs::read_to_string("src/main.rs")
+        .expect("Failed to read src/main.rs");
+    
+    let has_correct_default = main_rs.contains(r#"default_value = "0.0.0.0""#);
+    let has_wrong_default = main_rs.contains(r#"default_value = "127.0.0.1""#);
+    
+    assert!(
+        has_correct_default && !has_wrong_default,
+        "\n\n\
+        ❌ FAILED: Default hostname must be 0.0.0.0 for external access\n\
+        \n\
+        Current: default_value = \"127.0.0.1\" (localhost only)\n\
+        Required: default_value = \"0.0.0.0\" (all interfaces)\n\
+        \n\
+        Fix in src/main.rs line ~18:\n\
+        #[arg(short = 'H', long, default_value = \"0.0.0.0\")]\n\
+        \n\
+        This allows the server to be accessible from outside containers/VMs.\n\
+        "
+    );
+}
+
+// ============================================================================
+// UI Consistency Tests (TDD for unified styling)
+// ============================================================================
+
+#[tokio::test]
+async fn test_directory_index_has_consistent_styling() {
+    // RED: This test should FAIL initially because directory index uses basic HTML
+    // GREEN: Will pass after implementing proper template with theme support
+    
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    fs::write(temp_dir.path().join("test.md"), "# Test").expect("Write failed");
+
+    let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
+    let router = new_router(canonical_path).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create test server");
+
+    let response = server.get("/").await;
+    assert_eq!(response.status_code(), 200);
+    let body = response.text();
+
+    // Must have theme system
+    assert!(
+        body.contains("data-theme"),
+        "Directory index must support theme system with data-theme attribute"
+    );
+    
+    // Must have CSS variables for theming
+    assert!(
+        body.contains("--bg-color") || body.contains("var(--bg-color)"),
+        "Directory index must use CSS variables for theming"
+    );
+    
+    // Must have theme toggle button
+    assert!(
+        body.contains("theme-toggle") || body.contains("🎨"),
+        "Directory index must have theme toggle button"
+    );
+    
+    // Must have consistent font family
+    assert!(
+        body.contains("-apple-system") || body.contains("BlinkMacSystemFont"),
+        "Directory index must use same font family as markdown viewer"
+    );
+    
+    // Must have proper viewport and responsive design
+    assert!(
+        body.contains("viewport"),
+        "Directory index must have viewport meta tag"
+    );
+}
+
+#[tokio::test]
+async fn test_directory_index_theme_persistence() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    fs::write(temp_dir.path().join("test.md"), "# Test").expect("Write failed");
+
+    let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
+    let router = new_router(canonical_path).expect("Failed to create router");
+    let server = TestServer::new(router).expect("Failed to create test server");
+
+    let response = server.get("/").await;
+    let body = response.text();
+
+    // Must have localStorage theme persistence
+    assert!(
+        body.contains("localStorage") && body.contains("theme"),
+        "Directory index must persist theme preference in localStorage"
+    );
+    
+    // Must have theme initialization script
+    assert!(
+        body.contains("theme-initialized"),
+        "Directory index must have theme initialization to prevent flash"
+    );
+}

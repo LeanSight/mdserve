@@ -38,3 +38,4 @@ panic = "abort"
 axum-test = { version = "16.0", features = ["ws"] }
 tempfile = "3.0"
 tokio-test = "0.4"
+reqwest = "0.12"

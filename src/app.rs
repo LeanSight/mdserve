@@ -27,11 +27,24 @@ use tokio::{
 use tower_http::cors::CorsLayer;
 
 const TEMPLATE_NAME: &str = "main.html";
+const DIRECTORY_TEMPLATE_NAME: &str = "directory.html";
 static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
 const MERMAID_JS: &str = include_str!("../static/js/mermaid.min.js");
 const MERMAID_ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
 
+// Trait for content sources (file or directory)
+trait ContentSource: Send + Sync {
+    fn refresh_if_needed(&mut self) -> Result<bool>;
+    fn get_html(&self) -> String;
+    fn get_raw_content(&self) -> Result<String>;
+    fn get_base_dir(&self) -> &Path;
+    fn subscribe_to_changes(&self) -> broadcast::Receiver<ServerMessage>;
+}
+
+// Type aliases for content sources
+type FileContentSource = MarkdownState;
 type SharedMarkdownState = Arc<Mutex<MarkdownState>>;
+type SharedDirectoryState = Arc<Mutex<DirectoryState>>;
 
 fn template_env() -> &'static Environment<'static> {
     TEMPLATE_ENV.get_or_init(|| {
@@ -63,6 +76,61 @@ struct MarkdownState {
     change_tx: broadcast::Sender<ServerMessage>,
 }
 
+#[derive(Clone)]
+struct FileEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    is_markdown: bool,
+}
+
+struct DirectoryState {
+    root_dir: PathBuf,
+    file_cache: std::collections::HashMap<PathBuf, CachedFile>,
+    change_tx: broadcast::Sender<ServerMessage>,
+}
+
+struct CachedFile {
+    last_modified: SystemTime,
+    cached_html: String,
+}
+
+impl ContentSource for MarkdownState {
+    fn refresh_if_needed(&mut self) -> Result<bool> {
+        let metadata = fs::metadata(&self.file_path)?;
+        let current_modified = metadata.modified()?;
+
+        if current_modified > self.last_modified {
+            let content = fs::read_to_string(&self.file_path)?;
+            self.cached_html = Self::markdown_to_html(&content)?;
+            self.last_modified = current_modified;
+
+            // Send reload signal to all WebSocket clients
+            let _ = self.change_tx.send(ServerMessage::Reload);
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn get_html(&self) -> String {
+        self.cached_html.clone()
+    }
+
+    fn get_raw_content(&self) -> Result<String> {
+        Ok(fs::read_to_string(&self.file_path)?)
+    }
+
+    fn get_base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    fn subscribe_to_changes(&self) -> broadcast::Receiver<ServerMessage> {
+        self.change_tx.subscribe()
+    }
+}
+
 impl MarkdownState {
     fn new(file_path: PathBuf) -> Result<Self> {
         let metadata = fs::metadata(&file_path)?;
@@ -92,24 +160,6 @@ impl MarkdownState {
         })
     }
 
-    fn refresh_if_needed(&mut self) -> Result<bool> {
-        let metadata = fs::metadata(&self.file_path)?;
-        let current_modified = metadata.modified()?;
-
-        if current_modified > self.last_modified {
-            let content = fs::read_to_string(&self.file_path)?;
-            self.cached_html = Self::markdown_to_html(&content)?;
-            self.last_modified = current_modified;
-
-            // Send reload signal to all WebSocket clients
-            let _ = self.change_tx.send(ServerMessage::Reload);
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     fn markdown_to_html(content: &str) -> Result<String> {
         // Create GFM options with HTML rendering enabled
         let mut options = markdown::Options::gfm();
@@ -130,18 +180,31 @@ impl MarkdownState {
     }
 }
 
-/// Creates a new Router for serving markdown files.
+/// Creates a new Router for serving markdown files or directories.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The file cannot be read or doesn't exist
+/// - The file/directory cannot be read or doesn't exist
 /// - File metadata cannot be accessed
 /// - File watcher cannot be created
 /// - File watcher cannot watch the parent directory
-pub fn new_router(file_path: impl AsRef<Path>) -> Result<Router> {
-    let file_path = file_path.as_ref().to_path_buf();
+pub fn new_router(path: impl AsRef<Path>) -> Result<Router> {
+    let path = path.as_ref().to_path_buf();
+    
+    // Detect if path is a file or directory
+    let metadata = fs::metadata(&path)?;
+    
+    if metadata.is_dir() {
+        // For now, just create a simple router that accepts directories
+        // We'll implement full directory serving in Phase 2
+        new_directory_router(path)
+    } else {
+        new_file_router(path)
+    }
+}
 
+fn new_file_router(file_path: PathBuf) -> Result<Router> {
     let watcher_file_path = file_path.clone();
     let state = Arc::new(Mutex::new(MarkdownState::new(file_path)?));
 
@@ -198,6 +261,307 @@ pub fn new_router(file_path: impl AsRef<Path>) -> Result<Router> {
     Ok(router)
 }
 
+fn new_directory_router(dir_path: PathBuf) -> Result<Router> {
+    let state = Arc::new(Mutex::new(DirectoryState::new(dir_path)?));
+    
+    let router = Router::new()
+        .route("/", get(serve_directory_index))
+        .route("/view/*path", get(serve_file_from_directory))
+        .route("/raw/*path", get(serve_raw_from_directory))
+        .route("/ws", get(websocket_handler_directory))
+        .route("/mermaid.min.js", get(serve_mermaid_js))
+        .route("/*path", get(serve_static_from_directory))
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+    
+    Ok(router)
+}
+
+impl DirectoryState {
+    fn new(root_dir: PathBuf) -> Result<Self> {
+        let _metadata = fs::metadata(&root_dir)?;
+        let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
+        
+        Ok(DirectoryState {
+            root_dir,
+            file_cache: std::collections::HashMap::new(),
+            change_tx,
+        })
+    }
+    
+    fn list_directory(&self, rel_path: &Path) -> Result<Vec<FileEntry>> {
+        let full_path = self.root_dir.join(rel_path);
+        let canonical = validate_path_within_root(&full_path, &self.root_dir)?;
+        
+        let mut entries = Vec::new();
+        
+        for entry in fs::read_dir(&canonical)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            
+            // Skip hidden files
+            if name.starts_with('.') {
+                continue;
+            }
+            
+            let is_markdown = if metadata.is_file() {
+                matches!(
+                    entry.path().extension().and_then(|e| e.to_str()),
+                    Some("md") | Some("markdown") | Some("txt")
+                )
+            } else {
+                false
+            };
+            
+            entries.push(FileEntry {
+                name,
+                path: entry.path(),
+                is_dir: metadata.is_dir(),
+                is_markdown,
+            });
+        }
+        
+        // Sort: directories first, then files alphabetically
+        entries.sort_by(|a, b| {
+            match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.cmp(&b.name),
+            }
+        });
+        
+        Ok(entries)
+    }
+    
+    fn render_file(&mut self, rel_path: &Path) -> Result<String> {
+        let full_path = self.root_dir.join(rel_path);
+        let canonical = validate_path_within_root(&full_path, &self.root_dir)?;
+        
+        // Check cache
+        if let Some(cached) = self.file_cache.get(&canonical) {
+            let metadata = fs::metadata(&canonical)?;
+            let current_modified = metadata.modified()?;
+            
+            if current_modified <= cached.last_modified {
+                return Ok(cached.cached_html.clone());
+            }
+        }
+        
+        // Read and render
+        let content = fs::read_to_string(&canonical)?;
+        let html = MarkdownState::markdown_to_html(&content)?;
+        
+        // Update cache
+        let metadata = fs::metadata(&canonical)?;
+        self.file_cache.insert(
+            canonical,
+            CachedFile {
+                last_modified: metadata.modified()?,
+                cached_html: html.clone(),
+            },
+        );
+        
+        Ok(html)
+    }
+    
+    fn get_raw_file(&self, rel_path: &Path) -> Result<String> {
+        let full_path = self.root_dir.join(rel_path);
+        let canonical = validate_path_within_root(&full_path, &self.root_dir)?;
+        
+        Ok(fs::read_to_string(&canonical)?)
+    }
+}
+
+async fn serve_directory_index(State(state): State<SharedDirectoryState>) -> impl IntoResponse {
+    let state = state.lock().await;
+    
+    match state.list_directory(Path::new("")) {
+        Ok(entries) => {
+            // Convert entries to template format
+            let template_entries: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|entry| {
+                    let icon = if entry.is_dir { "📁" } else { "📄" };
+                    let link = if entry.is_dir {
+                        format!("/view/{}/", entry.name)
+                    } else {
+                        format!("/view/{}", entry.name)
+                    };
+                    serde_json::json!({
+                        "icon": icon,
+                        "name": entry.name,
+                        "link": link,
+                    })
+                })
+                .collect();
+            
+            let env = template_env();
+            let template = match env.get_template(DIRECTORY_TEMPLATE_NAME) {
+                Ok(t) => t,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Html(format!("<h1>Template Error</h1><p>{}</p>", e)),
+                    );
+                }
+            };
+            
+            let rendered = match template.render(context! {
+                title => "Directory Index",
+                current_path => "",
+                entries => template_entries,
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Html(format!("<h1>Render Error</h1><p>{}</p>", e)),
+                    );
+                }
+            };
+            
+            (StatusCode::OK, Html(rendered))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(format!("<h1>Error</h1><p>{}</p>", e)),
+        ),
+    }
+}
+
+async fn serve_file_from_directory(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<SharedDirectoryState>,
+) -> impl IntoResponse {
+    let mut state = state.lock().await;
+    
+    match state.render_file(Path::new(&path)) {
+        Ok(html) => (StatusCode::OK, Html(html)),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Html(format!("<h1>Not Found</h1><p>{}</p>", e)),
+        ),
+    }
+}
+
+async fn serve_raw_from_directory(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<SharedDirectoryState>,
+) -> impl IntoResponse {
+    let state = state.lock().await;
+    
+    match state.get_raw_file(Path::new(&path)) {
+        Ok(content) => (StatusCode::OK, content),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            format!("Error: {}", e),
+        ),
+    }
+}
+
+async fn serve_static_from_directory(
+    AxumPath(file_path): AxumPath<String>,
+    State(state): State<SharedDirectoryState>,
+) -> impl IntoResponse {
+    let state = state.lock().await;
+
+    if !is_image_file(&file_path) {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "File not found".to_string(),
+        )
+            .into_response();
+    }
+
+    let full_path = state.root_dir.join(&file_path);
+
+    match full_path.canonicalize() {
+        Ok(canonical_path) => {
+            if !canonical_path.starts_with(&state.root_dir) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    "Access denied".to_string(),
+                )
+                    .into_response();
+            }
+
+            match fs::read(&canonical_path) {
+                Ok(contents) => {
+                    let content_type = guess_image_content_type(&file_path);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, content_type.as_str())],
+                        contents,
+                    )
+                        .into_response()
+                }
+                Err(_) => (
+                    StatusCode::NOT_FOUND,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    "File not found".to_string(),
+                )
+                    .into_response(),
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "File not found".to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn websocket_handler_directory(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedDirectoryState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_websocket_directory(socket, state))
+}
+
+async fn handle_websocket_directory(socket: WebSocket, state: SharedDirectoryState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    let mut change_rx = {
+        let state = state.lock().await;
+        state.change_tx.subscribe()
+    };
+
+    let recv_task = tokio::spawn(async move {
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                        match client_msg {
+                            ClientMessage::Ping | ClientMessage::RequestRefresh => {}
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let send_task = tokio::spawn(async move {
+        while let Ok(reload_msg) = change_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&reload_msg) {
+                if sender.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = recv_task => {},
+        _ = send_task => {},
+    }
+}
+
 /// Serves a markdown file with live reload support.
 ///
 /// # Errors
@@ -248,12 +612,12 @@ async fn serve_html(State(state): State<SharedMarkdownState>) -> impl IntoRespon
         );
     }
 
-    (StatusCode::OK, Html(state.cached_html.clone()))
+    (StatusCode::OK, Html(state.get_html()))
 }
 
 async fn serve_raw(State(state): State<SharedMarkdownState>) -> impl IntoResponse {
     let state = state.lock().await;
-    match fs::read_to_string(&state.file_path) {
+    match state.get_raw_content() {
         Ok(content) => (StatusCode::OK, content),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -311,12 +675,12 @@ async fn serve_static_file(
     }
 
     // Construct the full path by joining base_dir with the requested path
-    let full_path = state.base_dir.join(&file_path);
+    let full_path = state.get_base_dir().join(&file_path);
 
     // Security check: ensure the resolved path is still within base_dir
     match full_path.canonicalize() {
         Ok(canonical_path) => {
-            if !canonical_path.starts_with(&state.base_dir) {
+            if !canonical_path.starts_with(state.get_base_dir()) {
                 return (
                     StatusCode::FORBIDDEN,
                     [(header::CONTENT_TYPE, "text/plain")],
@@ -351,6 +715,17 @@ async fn serve_static_file(
         )
             .into_response(),
     }
+}
+
+/// Validates that a path is within the root directory (prevents path traversal)
+fn validate_path_within_root(path: &Path, root: &Path) -> Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    
+    if !canonical.starts_with(root) {
+        anyhow::bail!("Access denied: path outside root directory");
+    }
+    
+    Ok(canonical)
 }
 
 fn is_image_file(file_path: &str) -> bool {
@@ -397,7 +772,7 @@ async fn handle_websocket(socket: WebSocket, state: SharedMarkdownState) {
     // Subscribe to file change notifications
     let mut change_rx = {
         let state = state.lock().await;
-        state.change_tx.subscribe()
+        state.subscribe_to_changes()
     };
 
     // Spawn task to handle incoming messages from client
@@ -435,5 +810,83 @@ async fn handle_websocket(socket: WebSocket, state: SharedMarkdownState) {
     tokio::select! {
         _ = recv_task => {},
         _ = send_task => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_file_content_source_implements_trait() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        fs::write(&temp_file, "# Test").expect("Failed to write");
+
+        let source = FileContentSource::new(temp_file.path().to_path_buf());
+        assert!(source.is_ok(), "FileContentSource should be created");
+    }
+
+    #[test]
+    fn test_file_content_source_get_html() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        fs::write(&temp_file, "# Hello\n\n**Bold**").expect("Failed to write");
+
+        let source = FileContentSource::new(temp_file.path().to_path_buf())
+            .expect("Failed to create source");
+
+        let html = source.get_html();
+        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains("<strong>Bold</strong>"));
+    }
+
+    #[test]
+    fn test_file_content_source_get_raw_content() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let content = "# Raw Content\n\nTest";
+        fs::write(&temp_file, content).expect("Failed to write");
+
+        let source = FileContentSource::new(temp_file.path().to_path_buf())
+            .expect("Failed to create source");
+
+        let raw = source.get_raw_content().expect("Failed to get raw content");
+        assert_eq!(raw, content);
+    }
+
+    #[test]
+    fn test_file_content_source_refresh_detects_changes() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        fs::write(&temp_file, "# Original").expect("Failed to write");
+
+        let mut source = FileContentSource::new(temp_file.path().to_path_buf())
+            .expect("Failed to create source");
+
+        // First check - no changes
+        let changed = source.refresh_if_needed().expect("Refresh failed");
+        assert!(!changed, "Should not detect changes on first check");
+
+        // Modify file
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&temp_file, "# Modified").expect("Failed to modify");
+
+        // Second check - should detect changes
+        let changed = source.refresh_if_needed().expect("Refresh failed");
+        assert!(changed, "Should detect file modification");
+
+        // Verify content updated
+        let html = source.get_html();
+        assert!(html.contains("<h1>Modified</h1>"));
+    }
+
+    #[test]
+    fn test_content_source_trait_object() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        fs::write(&temp_file, "# Trait Test").expect("Failed to write");
+
+        let source: Box<dyn ContentSource> =
+            Box::new(FileContentSource::new(temp_file.path().to_path_buf()).unwrap());
+
+        let html = source.get_html();
+        assert!(html.contains("<h1>Trait Test</h1>"));
     }
 }
