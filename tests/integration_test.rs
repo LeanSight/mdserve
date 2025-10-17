@@ -755,3 +755,46 @@ async fn test_directory_index_theme_persistence() {
         "Directory index must have theme initialization to prevent flash"
     );
 }
+
+// ============================================================================
+// Documentation Tests (TDD for README completeness)
+// ============================================================================
+
+#[test]
+fn test_readme_documents_directory_mode() {
+    // RED: This test should FAIL initially because README doesn't mention directory serving
+    // GREEN: Will pass after updating README with directory mode documentation
+    
+    let readme = std::fs::read_to_string("README.md")
+        .expect("Failed to read README.md");
+    
+    // Must document directory serving feature
+    assert!(
+        readme.contains("directory") || readme.contains("Directory"),
+        "README must document directory serving feature"
+    );
+    
+    // Must show example of serving a directory
+    assert!(
+        readme.contains("mdserve .") || readme.contains("mdserve docs/"),
+        "README must show example of serving a directory (e.g., 'mdserve .')"
+    );
+    
+    // Must document directory navigation
+    assert!(
+        readme.contains("navigation") || readme.contains("browse"),
+        "README must document directory navigation/browsing capability"
+    );
+}
+
+#[test]
+fn test_readme_credits_original_author() {
+    let readme = std::fs::read_to_string("README.md")
+        .expect("Failed to read README.md");
+    
+    // Must credit original author
+    assert!(
+        readme.contains("jfernandez") || readme.contains("Jose Fernandez"),
+        "README must credit original author (jfernandez/Jose Fernandez)"
+    );
+}
