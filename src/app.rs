@@ -583,10 +583,29 @@ pub async fn serve_markdown(
 
     let listener = TcpListener::bind((hostname, port)).await?;
 
-    let listen_addr = format_host(hostname, port);
-    println!("📄 Serving markdown file: {}", file_path.display());
-    println!("🌐 Server running at: http://{listen_addr}");
-    println!("⚡ Live reload enabled");
+    // Convert 0.0.0.0 to localhost for user-friendly display
+    let display_host = if hostname == "0.0.0.0" {
+        "localhost"
+    } else {
+        hostname
+    };
+    let display_addr = format_host(display_host, port);
+    
+    // Show appropriate message for file vs directory
+    if file_path.is_dir() {
+        println!("📁 Serving directory: {}", file_path.display());
+    } else {
+        println!("📄 Serving markdown file: {}", file_path.display());
+    }
+    
+    println!("🌐 Server running at: http://{display_addr}");
+    
+    // Show raw endpoint for file mode only
+    if file_path.is_file() {
+        println!("📝 Raw markdown at: http://{display_addr}/raw");
+    }
+    
+    println!("⚡ Live reload enabled – file changes will update content instantly");
     println!("\nPress Ctrl+C to stop the server");
 
     axum::serve(listener, router).await?;

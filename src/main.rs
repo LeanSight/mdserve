@@ -8,11 +8,11 @@ use app::serve_markdown;
 
 #[derive(Parser)]
 #[command(name = "mdserve")]
-#[command(about = "A simple HTTP server for markdown preview")]
+#[command(about = "Fast markdown preview server with live reload and directory browsing")]
 #[command(version)]
 struct Args {
-    /// Path to the markdown file to serve
-    file: PathBuf,
+    /// Path to markdown file or directory to serve
+    path: PathBuf,
 
     /// Hostname (domain or IP address) to listen on
     #[arg(short = 'H', long, default_value = "0.0.0.0")]
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Canonicalize the path once for consistent absolute path display
-    let absolute_path = args.file.canonicalize().unwrap_or(args.file);
+    let absolute_path = args.path.canonicalize().unwrap_or(args.path);
 
     serve_markdown(absolute_path, args.hostname, args.port).await?;
 
