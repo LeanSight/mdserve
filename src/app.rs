@@ -42,7 +42,6 @@ trait ContentSource: Send + Sync {
 }
 
 // Type aliases for content sources
-type FileContentSource = MarkdownState;
 type SharedMarkdownState = Arc<Mutex<MarkdownState>>;
 type SharedDirectoryState = Arc<Mutex<DirectoryState>>;
 
@@ -79,8 +78,10 @@ struct MarkdownState {
 #[derive(Clone)]
 struct FileEntry {
     name: String,
+    #[allow(dead_code)]
     path: PathBuf,
     is_dir: bool,
+    #[allow(dead_code)]
     is_markdown: bool,
 }
 
@@ -191,10 +192,10 @@ impl MarkdownState {
 /// - File watcher cannot watch the parent directory
 pub fn new_router(path: impl AsRef<Path>) -> Result<Router> {
     let path = path.as_ref().to_path_buf();
-    
+
     // Detect if path is a file or directory
     let metadata = fs::metadata(&path)?;
-    
+
     if metadata.is_dir() {
         // For now, just create a simple router that accepts directories
         // We'll implement full directory serving in Phase 2
@@ -263,7 +264,7 @@ fn new_file_router(file_path: PathBuf) -> Result<Router> {
 
 fn new_directory_router(dir_path: PathBuf) -> Result<Router> {
     let state = Arc::new(Mutex::new(DirectoryState::new(dir_path)?));
-    
+
     let router = Router::new()
         .route("/", get(serve_directory_index))
         .route("/view/*path", get(serve_file_from_directory))
@@ -273,7 +274,7 @@ fn new_directory_router(dir_path: PathBuf) -> Result<Router> {
         .route("/*path", get(serve_static_from_directory))
         .layer(CorsLayer::permissive())
         .with_state(state);
-    
+
     Ok(router)
 }
 
@@ -281,30 +282,30 @@ impl DirectoryState {
     fn new(root_dir: PathBuf) -> Result<Self> {
         let _metadata = fs::metadata(&root_dir)?;
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
-        
+
         Ok(DirectoryState {
             root_dir,
             file_cache: std::collections::HashMap::new(),
             change_tx,
         })
     }
-    
+
     fn list_directory(&self, rel_path: &Path) -> Result<Vec<FileEntry>> {
         let full_path = self.root_dir.join(rel_path);
         let canonical = validate_path_within_root(&full_path, &self.root_dir)?;
-        
+
         let mut entries = Vec::new();
-        
+
         for entry in fs::read_dir(&canonical)? {
             let entry = entry?;
             let metadata = entry.metadata()?;
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             // Skip hidden files
             if name.starts_with('.') {
                 continue;
             }
-            
+
             let is_markdown = if metadata.is_file() {
                 matches!(
                     entry.path().extension().and_then(|e| e.to_str()),
@@ -313,7 +314,7 @@ impl DirectoryState {
             } else {
                 false
             };
-            
+
             entries.push(FileEntry {
                 name,
                 path: entry.path(),
@@ -321,37 +322,35 @@ impl DirectoryState {
                 is_markdown,
             });
         }
-        
+
         // Sort: directories first, then files alphabetically
-        entries.sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.cmp(&b.name),
-            }
+        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
         });
-        
+
         Ok(entries)
     }
-    
+
     fn render_file(&mut self, rel_path: &Path) -> Result<String> {
         let full_path = self.root_dir.join(rel_path);
         let canonical = validate_path_within_root(&full_path, &self.root_dir)?;
-        
+
         // Check cache
         if let Some(cached) = self.file_cache.get(&canonical) {
             let metadata = fs::metadata(&canonical)?;
             let current_modified = metadata.modified()?;
-            
+
             if current_modified <= cached.last_modified {
                 return Ok(cached.cached_html.clone());
             }
         }
-        
+
         // Read and render
         let content = fs::read_to_string(&canonical)?;
         let html = MarkdownState::markdown_to_html(&content)?;
-        
+
         // Update cache
         let metadata = fs::metadata(&canonical)?;
         self.file_cache.insert(
@@ -361,21 +360,21 @@ impl DirectoryState {
                 cached_html: html.clone(),
             },
         );
-        
+
         Ok(html)
     }
-    
+
     fn get_raw_file(&self, rel_path: &Path) -> Result<String> {
         let full_path = self.root_dir.join(rel_path);
         let canonical = validate_path_within_root(&full_path, &self.root_dir)?;
-        
+
         Ok(fs::read_to_string(&canonical)?)
     }
 }
 
 async fn serve_directory_index(State(state): State<SharedDirectoryState>) -> impl IntoResponse {
     let state = state.lock().await;
-    
+
     match state.list_directory(Path::new("")) {
         Ok(entries) => {
             // Convert entries to template format
@@ -395,7 +394,7 @@ async fn serve_directory_index(State(state): State<SharedDirectoryState>) -> imp
                     })
                 })
                 .collect();
-            
+
             let env = template_env();
             let template = match env.get_template(DIRECTORY_TEMPLATE_NAME) {
                 Ok(t) => t,
@@ -406,7 +405,7 @@ async fn serve_directory_index(State(state): State<SharedDirectoryState>) -> imp
                     );
                 }
             };
-            
+
             let rendered = match template.render(context! {
                 title => "Directory Index",
                 current_path => "",
@@ -420,7 +419,7 @@ async fn serve_directory_index(State(state): State<SharedDirectoryState>) -> imp
                     );
                 }
             };
-            
+
             (StatusCode::OK, Html(rendered))
         }
         Err(e) => (
@@ -435,7 +434,7 @@ async fn serve_file_from_directory(
     State(state): State<SharedDirectoryState>,
 ) -> impl IntoResponse {
     let mut state = state.lock().await;
-    
+
     match state.render_file(Path::new(&path)) {
         Ok(html) => (StatusCode::OK, Html(html)),
         Err(e) => (
@@ -450,13 +449,10 @@ async fn serve_raw_from_directory(
     State(state): State<SharedDirectoryState>,
 ) -> impl IntoResponse {
     let state = state.lock().await;
-    
+
     match state.get_raw_file(Path::new(&path)) {
         Ok(content) => (StatusCode::OK, content),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            format!("Error: {}", e),
-        ),
+        Err(e) => (StatusCode::NOT_FOUND, format!("Error: {}", e)),
     }
 }
 
@@ -590,21 +586,21 @@ pub async fn serve_markdown(
         hostname
     };
     let display_addr = format_host(display_host, port);
-    
+
     // Show appropriate message for file vs directory
     if file_path.is_dir() {
         println!("📁 Serving directory: {}", file_path.display());
     } else {
         println!("📄 Serving markdown file: {}", file_path.display());
     }
-    
+
     println!("🌐 Server running at: http://{display_addr}");
-    
+
     // Show raw endpoint for file mode only
     if file_path.is_file() {
         println!("📝 Raw markdown at: http://{display_addr}/raw");
     }
-    
+
     println!("⚡ Live reload enabled – file changes will update content instantly");
     println!("\nPress Ctrl+C to stop the server");
 
@@ -739,11 +735,11 @@ async fn serve_static_file(
 /// Validates that a path is within the root directory (prevents path traversal)
 fn validate_path_within_root(path: &Path, root: &Path) -> Result<PathBuf> {
     let canonical = path.canonicalize()?;
-    
+
     if !canonical.starts_with(root) {
         anyhow::bail!("Access denied: path outside root directory");
     }
-    
+
     Ok(canonical)
 }
 
@@ -842,8 +838,8 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         fs::write(&temp_file, "# Test").expect("Failed to write");
 
-        let source = FileContentSource::new(temp_file.path().to_path_buf());
-        assert!(source.is_ok(), "FileContentSource should be created");
+        let source = MarkdownState::new(temp_file.path().to_path_buf());
+        assert!(source.is_ok(), "MarkdownState should be created");
     }
 
     #[test]
@@ -851,8 +847,8 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         fs::write(&temp_file, "# Hello\n\n**Bold**").expect("Failed to write");
 
-        let source = FileContentSource::new(temp_file.path().to_path_buf())
-            .expect("Failed to create source");
+        let source =
+            MarkdownState::new(temp_file.path().to_path_buf()).expect("Failed to create source");
 
         let html = source.get_html();
         assert!(html.contains("<h1>Hello</h1>"));
@@ -865,8 +861,8 @@ mod tests {
         let content = "# Raw Content\n\nTest";
         fs::write(&temp_file, content).expect("Failed to write");
 
-        let source = FileContentSource::new(temp_file.path().to_path_buf())
-            .expect("Failed to create source");
+        let source =
+            MarkdownState::new(temp_file.path().to_path_buf()).expect("Failed to create source");
 
         let raw = source.get_raw_content().expect("Failed to get raw content");
         assert_eq!(raw, content);
@@ -877,8 +873,8 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         fs::write(&temp_file, "# Original").expect("Failed to write");
 
-        let mut source = FileContentSource::new(temp_file.path().to_path_buf())
-            .expect("Failed to create source");
+        let mut source =
+            MarkdownState::new(temp_file.path().to_path_buf()).expect("Failed to create source");
 
         // First check - no changes
         let changed = source.refresh_if_needed().expect("Refresh failed");
@@ -903,7 +899,7 @@ mod tests {
         fs::write(&temp_file, "# Trait Test").expect("Failed to write");
 
         let source: Box<dyn ContentSource> =
-            Box::new(FileContentSource::new(temp_file.path().to_path_buf()).unwrap());
+            Box::new(MarkdownState::new(temp_file.path().to_path_buf()).unwrap());
 
         let html = source.get_html();
         assert!(html.contains("<h1>Trait Test</h1>"));

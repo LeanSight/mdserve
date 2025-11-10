@@ -568,8 +568,7 @@ async fn test_directory_serves_specific_file() {
 
     let temp_dir = tempdir().expect("Failed to create temp dir");
 
-    fs::write(temp_dir.path().join("test.md"), "# Test File\n\n**Bold**")
-        .expect("Write failed");
+    fs::write(temp_dir.path().join("test.md"), "# Test File\n\n**Bold**").expect("Write failed");
     fs::write(temp_dir.path().join("other.md"), "# Other").expect("Write failed");
 
     let canonical_path = temp_dir.path().canonicalize().expect("Canonicalize failed");
@@ -638,28 +637,27 @@ async fn test_directory_prevents_path_traversal() {
 #[test]
 fn test_default_hostname_must_be_public_for_containers() {
     // RED: This test MUST FAIL initially
-    // 
+    //
     // REQUIREMENT: Default hostname must be "0.0.0.0" not "127.0.0.1"
-    // 
+    //
     // WHY: In containerized/cloud environments (Docker, Gitpod, etc.),
     // binding to 127.0.0.1 makes the server ONLY accessible from inside
     // the container. External access requires binding to 0.0.0.0.
     //
-    // CURRENT STATE: main.rs has default_value = "127.0.0.1" 
+    // CURRENT STATE: main.rs has default_value = "127.0.0.1"
     // REQUIRED STATE: main.rs must have default_value = "0.0.0.0"
     //
     // TO FIX: Change line 18 in src/main.rs from:
     //   #[arg(short = 'H', long, default_value = "127.0.0.1")]
     // TO:
     //   #[arg(short = 'H', long, default_value = "0.0.0.0")]
-    
+
     // This test reads the source file to verify the default value
-    let main_rs = std::fs::read_to_string("src/main.rs")
-        .expect("Failed to read src/main.rs");
-    
+    let main_rs = std::fs::read_to_string("src/main.rs").expect("Failed to read src/main.rs");
+
     let has_correct_default = main_rs.contains(r#"default_value = "0.0.0.0""#);
     let has_wrong_default = main_rs.contains(r#"default_value = "127.0.0.1""#);
-    
+
     assert!(
         has_correct_default && !has_wrong_default,
         "\n\n\
@@ -684,7 +682,7 @@ fn test_default_hostname_must_be_public_for_containers() {
 async fn test_directory_index_has_consistent_styling() {
     // RED: This test should FAIL initially because directory index uses basic HTML
     // GREEN: Will pass after implementing proper template with theme support
-    
+
     use tempfile::tempdir;
 
     let temp_dir = tempdir().expect("Failed to create temp dir");
@@ -703,25 +701,25 @@ async fn test_directory_index_has_consistent_styling() {
         body.contains("data-theme"),
         "Directory index must support theme system with data-theme attribute"
     );
-    
+
     // Must have CSS variables for theming
     assert!(
         body.contains("--bg-color") || body.contains("var(--bg-color)"),
         "Directory index must use CSS variables for theming"
     );
-    
+
     // Must have theme toggle button
     assert!(
         body.contains("theme-toggle") || body.contains("🎨"),
         "Directory index must have theme toggle button"
     );
-    
+
     // Must have consistent font family
     assert!(
         body.contains("-apple-system") || body.contains("BlinkMacSystemFont"),
         "Directory index must use same font family as markdown viewer"
     );
-    
+
     // Must have proper viewport and responsive design
     assert!(
         body.contains("viewport"),
@@ -748,7 +746,7 @@ async fn test_directory_index_theme_persistence() {
         body.contains("localStorage") && body.contains("theme"),
         "Directory index must persist theme preference in localStorage"
     );
-    
+
     // Must have theme initialization script
     assert!(
         body.contains("theme-initialized"),
@@ -764,22 +762,21 @@ async fn test_directory_index_theme_persistence() {
 fn test_readme_documents_directory_mode() {
     // RED: This test should FAIL initially because README doesn't mention directory serving
     // GREEN: Will pass after updating README with directory mode documentation
-    
-    let readme = std::fs::read_to_string("README.md")
-        .expect("Failed to read README.md");
-    
+
+    let readme = std::fs::read_to_string("README.md").expect("Failed to read README.md");
+
     // Must document directory serving feature
     assert!(
         readme.contains("directory") || readme.contains("Directory"),
         "README must document directory serving feature"
     );
-    
+
     // Must show example of serving a directory
     assert!(
         readme.contains("mdserve .") || readme.contains("mdserve docs/"),
         "README must show example of serving a directory (e.g., 'mdserve .')"
     );
-    
+
     // Must document directory navigation
     assert!(
         readme.contains("navigation") || readme.contains("browse"),
@@ -789,9 +786,8 @@ fn test_readme_documents_directory_mode() {
 
 #[test]
 fn test_readme_credits_original_author() {
-    let readme = std::fs::read_to_string("README.md")
-        .expect("Failed to read README.md");
-    
+    let readme = std::fs::read_to_string("README.md").expect("Failed to read README.md");
+
     // Must credit original author
     assert!(
         readme.contains("jfernandez") || readme.contains("Jose Fernandez"),
